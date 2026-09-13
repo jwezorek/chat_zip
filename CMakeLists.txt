@@ -22,9 +22,15 @@ add_executable(chat_zip
     src/ui/main_window.cpp
     src/ui/patch_review_dialog.cpp
     src/main.cpp
+    resources/chat_zip.qrc
 )
 
 target_include_directories(chat_zip PRIVATE src)
+
+if(WIN32)
+    target_sources(chat_zip PRIVATE resources/chat_zip.rc)
+    target_include_directories(chat_zip PRIVATE resources)
+endif()
 target_link_libraries(
     chat_zip
     PRIVATE

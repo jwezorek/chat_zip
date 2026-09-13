@@ -2,6 +2,7 @@
 
 #include <QApplication>
 #include <QCoreApplication>
+#include <QIcon>
 #include <QWebEngineProfile>
 
 int main(int argc, char* argv[]) {
@@ -10,6 +11,7 @@ int main(int argc, char* argv[]) {
     QCoreApplication::setOrganizationName(QStringLiteral("ChatZip"));
     QCoreApplication::setApplicationName(QStringLiteral("ChatZip"));
     QCoreApplication::setApplicationVersion(QStringLiteral("0.1.0"));
+    QApplication::setWindowIcon(QIcon(QStringLiteral(":/icons/ChatZip.ico")));
 
     QWebEngineProfile web_profile(QStringLiteral("ChatZip"));
     web_profile.setPersistentCookiesPolicy(QWebEngineProfile::ForcePersistentCookies);

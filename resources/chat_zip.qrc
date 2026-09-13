@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/icons">
+        <file alias="ChatZip.ico">ChatZip.ico</file>
+    </qresource>
+</RCC>
