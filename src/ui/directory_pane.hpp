@@ -6,6 +6,7 @@
 
 class QFileSystemModel;
 class QLabel;
+class QPoint;
 class QPushButton;
 class QTreeView;
 
@@ -23,9 +24,11 @@ public:
 
 signals:
     void zipAttachRequested();
+    void fileAttachRequested(const QString& path);
 
 private:
     void chooseDirectory();
+    void showContextMenu(const QPoint& position);
     void updateZipButton();
 
     QFileSystemModel* model_{};

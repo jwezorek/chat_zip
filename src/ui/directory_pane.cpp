@@ -4,9 +4,11 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFileSystemModel>
-#include <QLabel>
 #include <QItemSelectionModel>
+#include <QLabel>
+#include <QMenu>
 #include <QPushButton>
+#include <QSettings>
 #include <QTreeView>
 #include <QVBoxLayout>
 
@@ -37,6 +39,7 @@ DirectoryPane::DirectoryPane(QWidget* parent)
     tree_->setSelectionBehavior(QAbstractItemView::SelectRows);
     tree_->setSelectionMode(QAbstractItemView::ExtendedSelection);
     tree_->setSortingEnabled(true);
+    tree_->setContextMenuPolicy(Qt::CustomContextMenu);
     tree_->sortByColumn(0, Qt::AscendingOrder);
 
     auto* layout = new QVBoxLayout(this);
@@ -48,11 +51,17 @@ DirectoryPane::DirectoryPane(QWidget* parent)
 
     connect(open_button, &QPushButton::clicked, this, [this] { chooseDirectory(); });
     connect(zip_attach_button_, &QPushButton::clicked, this, &DirectoryPane::zipAttachRequested);
+    connect(tree_, &QTreeView::customContextMenuRequested, this, &DirectoryPane::showContextMenu);
     connect(
         tree_->selectionModel(),
         &QItemSelectionModel::selectionChanged,
         this,
         [this] { updateZipButton(); });
+
+    const auto previous_root = QSettings().value(QStringLiteral("source/rootDirectory")).toString();
+    if (!previous_root.isEmpty()) {
+        setRootDirectory(previous_root);
+    }
 }
 
 void DirectoryPane::setRootDirectory(const QString& path) {
@@ -67,6 +76,7 @@ void DirectoryPane::setRootDirectory(const QString& path) {
     }
 
     root_directory_ = QDir::cleanPath(resolved_path);
+    QSettings().setValue(QStringLiteral("source/rootDirectory"), root_directory_);
     const auto root_index = model_->setRootPath(root_directory_);
     tree_->setRootIndex(root_index);
     tree_->clearSelection();
@@ -105,6 +115,25 @@ void DirectoryPane::chooseDirectory() {
 
     if (!directory.isEmpty()) {
         setRootDirectory(directory);
+    }
+}
+
+void DirectoryPane::showContextMenu(const QPoint& position) {
+    const auto index = tree_->indexAt(position);
+    if (!index.isValid()) {
+        return;
+    }
+
+    const QFileInfo info(model_->filePath(index));
+    if (!info.isFile()) {
+        return;
+    }
+
+    QMenu menu(this);
+    auto* attach_action = menu.addAction(tr("Attach to Chat"));
+    const auto selected_action = menu.exec(tree_->viewport()->mapToGlobal(position));
+    if (selected_action == attach_action) {
+        emit fileAttachRequested(QDir::cleanPath(info.absoluteFilePath()));
     }
 }
 

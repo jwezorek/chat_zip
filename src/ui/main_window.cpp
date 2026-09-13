@@ -14,6 +14,7 @@
 #include <QJsonDocument>
 #include <QList>
 #include <QMessageBox>
+#include <QMimeDatabase>
 #include <QPointer>
 #include <QSplitter>
 #include <QTemporaryDir>
@@ -45,34 +46,35 @@ constexpr qint64 uploadChunkSize = 256 * 1024;
 }
 
 // Chromium requires a genuine web user activation before it will open a file picker.
-// Instead of synthesizing clicks, put the prepared archive directly into ChatGPT's
-// hidden file input and dispatch the same input/change events a picker would produce.
-class ArchiveInjector final : public QObject {
+// Instead of synthesizing clicks, put the file directly into ChatGPT's hidden file
+// input and dispatch the same input/change events a picker would produce.
+class FileInjector final : public QObject {
 public:
-    ArchiveInjector(
+    FileInjector(
         QWebEnginePage& page,
         QWidget& parent,
-        QString archive_path)
+        QString file_path)
         : QObject(&page),
           page_(&page),
           parent_(&parent),
-          archive_path_(std::move(archive_path)),
-          archive_(archive_path_),
+          file_path_(std::move(file_path)),
+          file_(file_path_),
           token_(QUuid::createUuid().toString(QUuid::WithoutBraces)) {}
 
     void start() {
-        if (!archive_.open(QIODevice::ReadOnly)) {
-            fail(tr("ChatZip could not reopen the prepared ZIP for attachment:\n%1\n\n%2")
-                     .arg(archive_path_, archive_.errorString()));
+        if (!file_.open(QIODevice::ReadOnly)) {
+            fail(tr("ChatZip could not open the file for attachment:\n%1\n\n%2")
+                     .arg(file_path_, file_.errorString()));
             return;
         }
 
-        const auto file_name = QFileInfo(archive_path_).fileName();
-        const auto payload = compactJsonArray(QJsonArray{token_, file_name});
+        const auto file_name = QFileInfo(file_path_).fileName();
+        const auto mime_type = QMimeDatabase().mimeTypeForFile(file_path_).name();
+        const auto payload = compactJsonArray(QJsonArray{token_, file_name, mime_type});
         const auto input_expression = fileInputExpression();
         const auto script = QString::fromUtf8(R"JS(
 (() => {
-    const [token, fileName] = __CHATZIP_PAYLOAD__;
+    const [token, fileName, mimeType] = __CHATZIP_PAYLOAD__;
     const input = __CHATZIP_INPUT__;
     if (!input) {
         return { ok: false, reason: 'ChatGPT file input was not found.' };
@@ -81,6 +83,7 @@ public:
     window.__chatZipUploads ??= {};
     window.__chatZipUploads[token] = {
         fileName,
+        mimeType,
         chunks: []
     };
     return { ok: true, inputId: input.id || '' };
@@ -89,7 +92,7 @@ public:
                                 .replace(QStringLiteral("__CHATZIP_PAYLOAD__"), payload)
                                 .replace(QStringLiteral("__CHATZIP_INPUT__"), input_expression);
 
-        QPointer<ArchiveInjector> guarded(this);
+        QPointer<FileInjector> guarded(this);
         page_->runJavaScript(script, [guarded](const QVariant& value) {
             if (!guarded) {
                 return;
@@ -98,11 +101,11 @@ public:
             const auto result = value.toMap();
             if (!result.value(QStringLiteral("ok")).toBool()) {
                 guarded->fail(
-                    tr("The ZIP was created, but ChatZip could not find ChatGPT's file input.\n\n%1\n\n"
-                       "The prepared archive is at:\n%2")
+                    tr("ChatZip could not find ChatGPT's file input.\n\n%1\n\n"
+                       "The file is at:\n%2")
                         .arg(
                             result.value(QStringLiteral("reason")).toString(),
-                            guarded->archive_path_));
+                            guarded->file_path_));
                 return;
             }
 
@@ -117,11 +120,11 @@ private:
             return;
         }
 
-        const auto chunk = archive_.read(uploadChunkSize);
+        const auto chunk = file_.read(uploadChunkSize);
         if (chunk.isEmpty()) {
-            if (archive_.error() != QFile::NoError) {
-                fail(tr("ChatZip could not read the prepared ZIP while attaching it:\n%1\n\n%2")
-                         .arg(archive_path_, archive_.errorString()));
+            if (file_.error() != QFile::NoError) {
+                fail(tr("ChatZip could not read the file while attaching it:\n%1\n\n%2")
+                         .arg(file_path_, file_.errorString()));
                 return;
             }
 
@@ -142,7 +145,7 @@ private:
 )JS")
                                 .replace(QStringLiteral("__CHATZIP_PAYLOAD__"), payload);
 
-        QPointer<ArchiveInjector> guarded(this);
+        QPointer<FileInjector> guarded(this);
         page_->runJavaScript(script, [guarded](const QVariant& value) {
             if (!guarded) {
                 return;
@@ -151,8 +154,8 @@ private:
             if (!value.toBool()) {
                 guarded->fail(
                     tr("ChatGPT discarded the pending attachment before it was complete.\n\n"
-                       "The prepared archive is at:\n%1")
-                        .arg(guarded->archive_path_));
+                       "The file is at:\n%1")
+                        .arg(guarded->file_path_));
                 return;
             }
 
@@ -187,7 +190,7 @@ private:
         });
 
         const file = new File(parts, upload.fileName, {
-            type: 'application/zip',
+            type: upload.mimeType || 'application/octet-stream',
             lastModified: Date.now()
         });
         const transfer = new DataTransfer();
@@ -216,7 +219,7 @@ private:
                                 .replace(QStringLiteral("__CHATZIP_PAYLOAD__"), payload)
                                 .replace(QStringLiteral("__CHATZIP_INPUT__"), input_expression);
 
-        QPointer<ArchiveInjector> guarded(this);
+        QPointer<FileInjector> guarded(this);
         page_->runJavaScript(script, [guarded](const QVariant& value) {
             if (!guarded) {
                 return;
@@ -225,11 +228,11 @@ private:
             const auto result = value.toMap();
             if (!result.value(QStringLiteral("ok")).toBool()) {
                 guarded->fail(
-                    tr("The ZIP was created, but ChatZip could not place it into ChatGPT's upload "
-                       "input.\n\n%1\n\nThe prepared archive is at:\n%2")
+                    tr("ChatZip could not place the file into ChatGPT's upload input.\n\n%1\n\n"
+                       "The file is at:\n%2")
                         .arg(
                             result.value(QStringLiteral("reason")).toString(),
-                            guarded->archive_path_));
+                            guarded->file_path_));
                 return;
             }
 
@@ -241,7 +244,7 @@ private:
         if (parent_) {
             QMessageBox::warning(
                 parent_,
-                tr("Could Not Attach ZIP"),
+                tr("Could Not Attach File"),
                 detail);
         }
         deleteLater();
@@ -249,16 +252,16 @@ private:
 
     QPointer<QWebEnginePage> page_;
     QPointer<QWidget> parent_;
-    QString archive_path_;
-    QFile archive_;
+    QString file_path_;
+    QFile file_;
     QString token_;
 };
 
-void attachArchive(
+void attachFile(
     QWebEnginePage& page,
     QWidget& parent,
-    const QString& archive_path) {
-    auto* injector = new ArchiveInjector(page, parent, archive_path);
+    const QString& file_path) {
+    auto* injector = new FileInjector(page, parent, file_path);
     injector->start();
 }
 
@@ -462,6 +465,14 @@ MainWindow::MainWindow(QWebEngineProfile& web_profile, QWidget* parent)
 
     connect(
         directory_pane,
+        &DirectoryPane::fileAttachRequested,
+        this,
+        [this, web_page](const QString& file_path) {
+            attachFile(*web_page, *this, file_path);
+        });
+
+    connect(
+        directory_pane,
         &DirectoryPane::zipAttachRequested,
         this,
         [this, directory_pane, web_page] {
@@ -484,7 +495,7 @@ MainWindow::MainWindow(QWebEngineProfile& web_profile, QWidget* parent)
                 return;
             }
 
-            attachArchive(*web_page, *this, archive_path);
+            attachFile(*web_page, *this, archive_path);
         });
 
     directory_pane->setMinimumWidth(300);
