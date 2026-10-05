@@ -105,6 +105,13 @@ QStringList DirectoryPane::selectedPaths() const {
     return paths;
 }
 
+void DirectoryPane::setZipAttachBusy(bool busy, const QString& status_text) {
+    zip_attach_busy_ = busy;
+    zip_attach_button_->setText(
+        busy && !status_text.isEmpty() ? status_text : tr("Zip && Attach"));
+    updateZipButton();
+}
+
 void DirectoryPane::chooseDirectory() {
     const auto start_directory = root_directory_.isEmpty() ? QDir::homePath() : root_directory_;
     const auto directory = QFileDialog::getExistingDirectory(
@@ -138,7 +145,8 @@ void DirectoryPane::showContextMenu(const QPoint& position) {
 }
 
 void DirectoryPane::updateZipButton() {
-    zip_attach_button_->setEnabled(!root_directory_.isEmpty() && !selectedPaths().isEmpty());
+    zip_attach_button_->setEnabled(
+        !zip_attach_busy_ && !root_directory_.isEmpty() && !selectedPaths().isEmpty());
 }
 
 } // namespace ui

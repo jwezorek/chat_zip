@@ -1,6 +1,9 @@
 #include "archive/zip_archive.hpp"
 
+#include <QDateTime>
+#include <QDebug>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
@@ -21,9 +24,23 @@ namespace {
 struct ArchiveItem {
     QString source_path;
     QString archive_path;
+    qint64 source_size{};
 };
 
+void logZip(const QString& message) {
+    qInfo().noquote()
+        << QStringLiteral("%1 [ChatZip] %2")
+               .arg(
+                   QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss.zzz")),
+                   message);
+}
+
 [[nodiscard]] ZipResult failure(QString message) {
+    qWarning().noquote()
+        << QStringLiteral("%1 [ChatZip] ZIP failed: %2")
+               .arg(
+                   QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss.zzz")),
+                   message);
     return {.success = false, .error = std::move(message)};
 }
 
@@ -97,7 +114,7 @@ struct MinizFree {
 
     if (!seen_entries.contains(archive_entry)) {
         seen_entries.insert(archive_entry);
-        items.push_back({canonical_source, std::move(archive_entry)});
+        items.push_back({canonical_source, std::move(archive_entry), source_info.size()});
     }
     return {.success = true};
 }
@@ -154,6 +171,9 @@ ZipResult createZipArchive(
     const QString& root_directory,
     const QStringList& selected_paths,
     const QString& archive_path) {
+    QElapsedTimer total_timer;
+    total_timer.start();
+
     if (selected_paths.isEmpty()) {
         return failure(QStringLiteral("No files or directories are selected."));
     }
@@ -164,6 +184,9 @@ ZipResult createZipArchive(
     }
     const auto root = canonicalPath(root_info);
 
+    logZip(QStringLiteral("Enumerating ZIP selection..."));
+    QElapsedTimer phase_timer;
+    phase_timer.start();
     std::vector<ArchiveItem> items;
     const auto collection_result = collectItems(root, selected_paths, items);
     if (!collection_result.success) {
@@ -173,6 +196,19 @@ ZipResult createZipArchive(
         return failure(QStringLiteral("The selection does not contain any files."));
     }
 
+    qint64 total_source_bytes = 0;
+    for (const auto& item : items) {
+        if (item.source_size > 0 &&
+            total_source_bytes <= std::numeric_limits<qint64>::max() - item.source_size) {
+            total_source_bytes += item.source_size;
+        }
+    }
+    logZip(
+        QStringLiteral("Enumeration complete: %1 file(s), %2 bytes, %3 ms")
+            .arg(static_cast<qulonglong>(items.size()))
+            .arg(total_source_bytes)
+            .arg(phase_timer.elapsed()));
+
     mz_zip_archive zip{};
     WriterGuard writer_guard(zip);
     if (!mz_zip_writer_init_heap(&zip, 0, 0)) {
@@ -180,6 +216,9 @@ ZipResult createZipArchive(
     }
     writer_guard.markInitialized();
 
+    phase_timer.restart();
+    logZip(QStringLiteral("Reading and compressing ZIP contents..."));
+    qsizetype processed = 0;
     for (const auto& item : items) {
         QFile source(item.source_path);
         if (!source.open(QIODevice::ReadOnly)) {
@@ -204,8 +243,19 @@ ZipResult createZipArchive(
                 QStringLiteral("Could not add %1 to ZIP: %2")
                     .arg(item.archive_path, minizError(zip)));
         }
-    }
 
+        ++processed;
+        if (processed == static_cast<qsizetype>(items.size()) || processed % 250 == 0) {
+            logZip(
+                QStringLiteral("Compressed %1/%2 file(s)")
+                    .arg(processed)
+                    .arg(static_cast<qulonglong>(items.size())));
+        }
+    }
+    logZip(QStringLiteral("Read/compress complete: %1 ms").arg(phase_timer.elapsed()));
+
+    phase_timer.restart();
+    logZip(QStringLiteral("Finalizing and writing ZIP..."));
     void* archive_data_raw = nullptr;
     size_t archive_size = 0;
     if (!mz_zip_writer_finalize_heap_archive(&zip, &archive_data_raw, &archive_size)) {
@@ -233,6 +283,11 @@ ZipResult createZipArchive(
             QStringLiteral("Could not finish %1: %2").arg(archive_path, output.errorString()));
     }
 
+    logZip(
+        QStringLiteral("ZIP complete: %1 bytes, write/finalize %2 ms, total %3 ms")
+            .arg(static_cast<qulonglong>(archive_size))
+            .arg(phase_timer.elapsed())
+            .arg(total_timer.elapsed()));
     return {.success = true};
 }
 

@@ -21,6 +21,7 @@ public:
     void setRootDirectory(const QString& path);
     [[nodiscard]] QString rootDirectory() const;
     [[nodiscard]] QStringList selectedPaths() const;
+    void setZipAttachBusy(bool busy, const QString& status_text = {});
 
 signals:
     void zipAttachRequested();
@@ -36,6 +37,7 @@ private:
     QLabel* root_label_{};
     QPushButton* zip_attach_button_{};
     QString root_directory_;
+    bool zip_attach_busy_{};
 };
 
 } // namespace ui
