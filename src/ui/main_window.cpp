@@ -38,22 +38,133 @@ namespace ui {
 namespace {
 
 constexpr qint64 uploadChunkSize = 256 * 1024;
+constexpr int attachmentVerificationIntervalMilliseconds = 250;
+constexpr int attachmentVerificationAttempts = 16;
 
 [[nodiscard]] QString compactJsonArray(const QJsonArray& values) {
     return QString::fromUtf8(QJsonDocument(values).toJson(QJsonDocument::Compact));
 }
 
 [[nodiscard]] QString fileInputExpression() {
-    return QStringLiteral(
-        "document.querySelector('input#upload-files') || "
-        "[...document.querySelectorAll('input[type=\\\"file\\\"]')]"
-        ".find((input) => !/photo|camera/i.test(input.id || '')) || "
-        "document.querySelector('input[type=\\\"file\\\"]')");
+    return QString::fromUtf8(R"JS(
+(() => {
+    const allInputs = [...document.querySelectorAll('input[type="file"]')];
+    const isImageOnly = (input) => {
+        const accept = (input.accept || '').trim().toLowerCase();
+        if (!accept) return false;
+
+        const tokens = accept.split(',').map((token) => token.trim()).filter(Boolean);
+        return tokens.length > 0 && tokens.every((token) =>
+            token.startsWith('image/') ||
+            /^\.(?:avif|bmp|gif|heic|heif|jpe?g|png|svg|webp)$/.test(token));
+    };
+    const usable = (inputs) => inputs.filter((input) => !input.disabled && !isImageOnly(input));
+    const describe = (input) => ({
+        id: input.id || '',
+        name: input.name || '',
+        accept: input.accept || '',
+        multiple: !!input.multiple,
+        ariaLabel: input.getAttribute('aria-label') || '',
+        testId: input.getAttribute('data-testid') || ''
+    });
+
+    const isVisible = (element) => element.getClientRects().length > 0;
+    const prompt = [...document.querySelectorAll('#prompt-textarea')]
+            .find(isVisible) ||
+        [...document.querySelectorAll('[contenteditable="true"]')]
+            .find(isVisible) ||
+        [...document.querySelectorAll('textarea')]
+            .find(isVisible) ||
+        null;
+
+    let candidates = [];
+    if (prompt) {
+        const form = prompt.closest('form');
+        if (form) {
+            candidates = usable([...form.querySelectorAll('input[type="file"]')]);
+        }
+
+        // The ChatGPT composer has not always used a <form>. Walk a few
+        // ancestors so an upload input owned by the composer still wins over
+        // unrelated file inputs elsewhere on the page.
+        if (candidates.length === 0) {
+            let ancestor = prompt.parentElement;
+            for (let depth = 0; ancestor && depth < 7; ++depth, ancestor = ancestor.parentElement) {
+                const nearby = usable([...ancestor.querySelectorAll('input[type="file"]')]);
+                if (nearby.length > 0) {
+                    candidates = nearby;
+                    break;
+                }
+            }
+        }
+    }
+
+    const choose = (inputs) => {
+        if (inputs.length === 0) return null;
+        if (inputs.length === 1) return inputs[0];
+
+        const scored = inputs.map((input) => {
+            const attributes = [
+                input.id,
+                input.name,
+                input.getAttribute('aria-label'),
+                input.getAttribute('data-testid')
+            ].filter(Boolean).join(' ').toLowerCase();
+            let score = 0;
+            if (input.id === 'upload-files') score += 1000;
+            if (/upload|attach|file/.test(attributes)) score += 100;
+            if (input.multiple) score += 10;
+            return { input, score };
+        }).sort((left, right) => right.score - left.score);
+        return scored[0].score > scored[1].score ? scored[0].input : null;
+    };
+
+    let input = choose(candidates);
+    let method = input ? 'composer' : '';
+    if (!input) {
+        const exactUploads = usable(allInputs.filter((candidate) => candidate.id === 'upload-files'));
+        input = exactUploads.length === 1 ? exactUploads[0] : null;
+        if (input) method = 'upload-files-id';
+    }
+    if (!input) {
+        const globalCandidates = usable(allInputs);
+        input = globalCandidates.length === 1 ? globalCandidates[0] : null;
+        if (input) method = 'only-file-input';
+    }
+
+    return {
+        input,
+        method,
+        diagnostics: JSON.stringify({
+            path: location.pathname,
+            promptFound: !!prompt,
+            fileInputs: allInputs.map(describe)
+        })
+    };
+})()
+)JS");
+}
+
+[[nodiscard]] QString dropTargetExpression() {
+    return QString::fromUtf8(R"JS(
+(() => {
+    const isVisible = (element) => element.getClientRects().length > 0;
+    const prompt = [...document.querySelectorAll('#prompt-textarea')]
+            .find(isVisible) ||
+        [...document.querySelectorAll('[contenteditable="true"]')]
+            .find(isVisible) ||
+        [...document.querySelectorAll('textarea')]
+            .find(isVisible) ||
+        null;
+    return prompt;
+})()
+)JS");
 }
 
 // Chromium requires a genuine web user activation before it will open a file picker.
-// Instead of synthesizing clicks, put the file directly into ChatGPT's hidden file
-// input and dispatch the same input/change events a picker would produce.
+// Instead of synthesizing clicks, put the file directly into the upload input owned
+// by the visible composer. If ChatGPT stops exposing that input, fall back to the
+// composer's drag/drop path.
 class FileInjector final : public QObject {
 public:
     using Completion = std::function<void(bool)>;
@@ -101,10 +212,7 @@ public:
         const auto script = QString::fromUtf8(R"JS(
 (() => {
     const [token, fileName, mimeType] = __CHATZIP_PAYLOAD__;
-    const input = __CHATZIP_INPUT__;
-    if (!input) {
-        return { ok: false, reason: 'ChatGPT file input was not found.' };
-    }
+    const lookup = __CHATZIP_INPUT__;
 
     window.__chatZipUploads ??= {};
     window.__chatZipUploads[token] = {
@@ -112,13 +220,18 @@ public:
         mimeType,
         parts: []
     };
-    return { ok: true, inputId: input.id || '' };
+    return {
+        ok: true,
+        inputFound: !!lookup.input,
+        inputMethod: lookup.method || '',
+        diagnostics: lookup.diagnostics || ''
+    };
 })()
 )JS")
                                 .replace(QStringLiteral("__CHATZIP_PAYLOAD__"), payload)
                                 .replace(QStringLiteral("__CHATZIP_INPUT__"), input_expression);
 
-        beginJavascriptWait(tr("locating ChatGPT's file input"));
+        beginJavascriptWait(tr("preparing the ChatGPT attachment"));
         QPointer<FileInjector> guarded(this);
         page_->runJavaScript(script, [guarded](const QVariant& value) {
             if (!guarded || guarded->terminal_) {
@@ -127,15 +240,14 @@ public:
 
             guarded->endJavascriptWait();
             const auto result = value.toMap();
-            if (!result.value(QStringLiteral("ok")).toBool()) {
-                guarded->fail(
-                    tr("ChatZip could not find ChatGPT's file input.\n\n%1\n\n"
-                       "The file is at:\n%2")
-                        .arg(
-                            result.value(QStringLiteral("reason")).toString(),
-                            guarded->file_path_));
-                return;
-            }
+            guarded->last_diagnostics_ = result.value(QStringLiteral("diagnostics")).toString();
+            guarded->log(
+                QStringLiteral("Composer upload input: %1 (%2)")
+                    .arg(
+                        result.value(QStringLiteral("inputFound")).toBool()
+                            ? QStringLiteral("found")
+                            : QStringLiteral("not found"),
+                        result.value(QStringLiteral("inputMethod")).toString()));
 
             guarded->sendNextChunk();
         });
@@ -222,6 +334,7 @@ private:
 
         const auto payload = compactJsonArray(QJsonArray{token_});
         const auto input_expression = fileInputExpression();
+        const auto drop_target_expression = dropTargetExpression();
         const auto script = QString::fromUtf8(R"JS(
 (() => {
     const [token] = __CHATZIP_PAYLOAD__;
@@ -231,42 +344,73 @@ private:
     }
 
     try {
-        const input = __CHATZIP_INPUT__;
-        if (!input) {
-            return { ok: false, reason: 'ChatGPT file input disappeared.' };
-        }
-
         const file = new File(upload.parts, upload.fileName, {
             type: upload.mimeType || 'application/octet-stream',
             lastModified: Date.now()
         });
+        const lookup = __CHATZIP_INPUT__;
+        const input = lookup.input;
+        if (input) {
+            const transfer = new DataTransfer();
+            transfer.items.add(file);
+            input.files = transfer.files;
+
+            input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+
+            return {
+                ok: true,
+                method: 'input',
+                fileName: file.name,
+                fileSize: file.size,
+                inputId: input.id || '',
+                inputMethod: lookup.method || '',
+                diagnostics: lookup.diagnostics || ''
+            };
+        }
+
+        const dropTarget = __CHATZIP_DROP_TARGET__;
+        if (!dropTarget) {
+            return {
+                ok: false,
+                reason: 'Neither a ChatGPT upload input nor the message composer was found.',
+                diagnostics: lookup.diagnostics || ''
+            };
+        }
+
         const transfer = new DataTransfer();
         transfer.items.add(file);
-        input.files = transfer.files;
-
-        input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+        for (const eventName of ['dragenter', 'dragover', 'drop']) {
+            dropTarget.dispatchEvent(new DragEvent(eventName, {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                dataTransfer: transfer
+            }));
+        }
 
         return {
             ok: true,
+            method: 'drop',
             fileName: file.name,
             fileSize: file.size,
-            inputId: input.id || ''
+            diagnostics: lookup.diagnostics || ''
         };
     } catch (error) {
         return {
             ok: false,
             reason: error instanceof Error ? error.message : String(error)
         };
-    } finally {
-        delete window.__chatZipUploads[token];
     }
 })()
 )JS")
                                 .replace(QStringLiteral("__CHATZIP_PAYLOAD__"), payload)
-                                .replace(QStringLiteral("__CHATZIP_INPUT__"), input_expression);
+                                .replace(QStringLiteral("__CHATZIP_INPUT__"), input_expression)
+                                .replace(
+                                    QStringLiteral("__CHATZIP_DROP_TARGET__"),
+                                    drop_target_expression);
 
-        beginJavascriptWait(tr("placing the completed file into ChatGPT's upload input"));
+        beginJavascriptWait(tr("handing the completed file to ChatGPT"));
         QPointer<FileInjector> guarded(this);
         page_->runJavaScript(script, [guarded](const QVariant& value) {
             if (!guarded || guarded->terminal_) {
@@ -277,7 +421,7 @@ private:
             const auto result = value.toMap();
             if (!result.value(QStringLiteral("ok")).toBool()) {
                 guarded->fail(
-                    tr("ChatZip could not place the file into ChatGPT's upload input.\n\n%1\n\n"
+                    tr("ChatZip could not hand the file to ChatGPT's composer.\n\n%1\n\n"
                        "The file is at:\n%2")
                         .arg(
                             result.value(QStringLiteral("reason")).toString(),
@@ -285,7 +429,182 @@ private:
                 return;
             }
 
-            guarded->succeed();
+            guarded->last_dispatch_method_ = result.value(QStringLiteral("method")).toString();
+            guarded->last_diagnostics_ = result.value(QStringLiteral("diagnostics")).toString();
+            guarded->log(
+                QStringLiteral("Attachment dispatched through %1")
+                    .arg(guarded->last_dispatch_method_));
+            guarded->verifyUpload(attachmentVerificationAttempts, true);
+        });
+    }
+
+    void verifyUpload(int attempts_remaining, bool allow_drop_fallback) {
+        if (terminal_) {
+            return;
+        }
+        if (!page_) {
+            fail(tr("The ChatGPT page closed while ChatZip was verifying the attachment.\n\n%1")
+                     .arg(file_path_));
+            return;
+        }
+
+        const auto payload = compactJsonArray(QJsonArray{token_});
+        const auto script = QString::fromUtf8(R"JS(
+(() => {
+    const [token] = __CHATZIP_PAYLOAD__;
+    const upload = window.__chatZipUploads?.[token];
+    if (!upload) {
+        return { ok: false, lost: true };
+    }
+
+    const fileName = upload.fileName;
+    const bodyText = document.body?.innerText || '';
+    if (bodyText.includes(fileName)) {
+        return { ok: true, evidence: 'text' };
+    }
+
+    const attributed = [...document.querySelectorAll('[aria-label], [title]')]
+        .some((element) =>
+            (element.getAttribute('aria-label') || '').includes(fileName) ||
+            (element.getAttribute('title') || '').includes(fileName));
+    return { ok: attributed, evidence: attributed ? 'attribute' : '' };
+})()
+)JS")
+                                .replace(QStringLiteral("__CHATZIP_PAYLOAD__"), payload);
+
+        beginJavascriptWait(tr("verifying that ChatGPT accepted the attachment"));
+        QPointer<FileInjector> guarded(this);
+        page_->runJavaScript(
+            script,
+            [guarded, attempts_remaining, allow_drop_fallback](const QVariant& value) {
+                if (!guarded || guarded->terminal_) {
+                    return;
+                }
+
+                guarded->endJavascriptWait();
+                const auto result = value.toMap();
+                if (result.value(QStringLiteral("ok")).toBool()) {
+                    guarded->log(
+                        QStringLiteral("Attachment visible in ChatGPT (%1)")
+                            .arg(result.value(QStringLiteral("evidence")).toString()));
+                    guarded->succeed();
+                    return;
+                }
+                if (result.value(QStringLiteral("lost")).toBool()) {
+                    guarded->fail(
+                        tr("ChatGPT discarded the pending attachment while ChatZip was verifying it.\n\n"
+                           "The file is at:\n%1")
+                            .arg(guarded->file_path_));
+                    return;
+                }
+
+                if (attempts_remaining > 1) {
+                    QTimer::singleShot(
+                        attachmentVerificationIntervalMilliseconds,
+                        guarded,
+                        [guarded, attempts_remaining, allow_drop_fallback] {
+                            if (guarded) {
+                                guarded->verifyUpload(
+                                    attempts_remaining - 1,
+                                    allow_drop_fallback);
+                            }
+                        });
+                    return;
+                }
+
+                if (allow_drop_fallback && guarded->last_dispatch_method_ == QStringLiteral("input")) {
+                    guarded->log(
+                        QStringLiteral("No attachment appeared after input events; trying composer drop fallback"));
+                    guarded->dispatchDropFallback();
+                    return;
+                }
+
+                auto detail = tr("ChatZip sent the file to the page, but ChatGPT did not show an attachment.\n\n"
+                                 "This usually means ChatGPT changed its composer DOM or upload handling.\n\n"
+                                 "The file is at:\n%1")
+                                  .arg(guarded->file_path_);
+                if (!guarded->last_diagnostics_.isEmpty()) {
+                    detail += tr("\n\nPage diagnostics:\n%1").arg(guarded->last_diagnostics_);
+                }
+                guarded->fail(detail);
+            });
+    }
+
+    void dispatchDropFallback() {
+        if (terminal_) {
+            return;
+        }
+        if (!page_) {
+            fail(tr("The ChatGPT page closed while ChatZip was retrying the attachment.\n\n%1")
+                     .arg(file_path_));
+            return;
+        }
+
+        const auto payload = compactJsonArray(QJsonArray{token_});
+        const auto drop_target_expression = dropTargetExpression();
+        const auto script = QString::fromUtf8(R"JS(
+(() => {
+    const [token] = __CHATZIP_PAYLOAD__;
+    const upload = window.__chatZipUploads?.[token];
+    if (!upload) {
+        return { ok: false, reason: 'Pending upload data was lost.' };
+    }
+
+    try {
+        const dropTarget = __CHATZIP_DROP_TARGET__;
+        if (!dropTarget) {
+            return { ok: false, reason: 'The ChatGPT message composer was not found.' };
+        }
+
+        const file = new File(upload.parts, upload.fileName, {
+            type: upload.mimeType || 'application/octet-stream',
+            lastModified: Date.now()
+        });
+        const transfer = new DataTransfer();
+        transfer.items.add(file);
+        for (const eventName of ['dragenter', 'dragover', 'drop']) {
+            dropTarget.dispatchEvent(new DragEvent(eventName, {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                dataTransfer: transfer
+            }));
+        }
+        return { ok: true };
+    } catch (error) {
+        return {
+            ok: false,
+            reason: error instanceof Error ? error.message : String(error)
+        };
+    }
+})()
+)JS")
+                                .replace(QStringLiteral("__CHATZIP_PAYLOAD__"), payload)
+                                .replace(
+                                    QStringLiteral("__CHATZIP_DROP_TARGET__"),
+                                    drop_target_expression);
+
+        beginJavascriptWait(tr("retrying the attachment through the ChatGPT composer"));
+        QPointer<FileInjector> guarded(this);
+        page_->runJavaScript(script, [guarded](const QVariant& value) {
+            if (!guarded || guarded->terminal_) {
+                return;
+            }
+
+            guarded->endJavascriptWait();
+            const auto result = value.toMap();
+            if (!result.value(QStringLiteral("ok")).toBool()) {
+                guarded->fail(
+                    tr("ChatZip could not retry the attachment through the ChatGPT composer.\n\n%1\n\n"
+                       "The file is at:\n%2")
+                        .arg(
+                            result.value(QStringLiteral("reason")).toString(),
+                            guarded->file_path_));
+                return;
+            }
+
+            guarded->last_dispatch_method_ = QStringLiteral("drop");
+            guarded->verifyUpload(attachmentVerificationAttempts, false);
         });
     }
 
@@ -324,6 +643,7 @@ private:
 
         terminal_ = true;
         javascript_timeout_.stop();
+        cleanupPendingUpload();
         log(QStringLiteral("Attachment accepted by browser in %1 ms").arg(elapsed_.elapsed()));
         auto completion = std::move(completion_);
         if (completion) {
@@ -373,6 +693,8 @@ private:
     qint64 total_bytes_{};
     qint64 total_chunks_{};
     qint64 chunks_sent_{};
+    QString last_dispatch_method_;
+    QString last_diagnostics_;
     bool terminal_{};
 };
 
